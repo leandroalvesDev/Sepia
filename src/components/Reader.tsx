@@ -1568,6 +1568,13 @@ export default function Reader() {
   const currentUrl = pages[currentIndex];
   const isUrlValid = currentUrl && typeof currentUrl === 'string' && currentUrl.length > 0;
 
+  // Limita o nome do arquivo exibido na TopBar (o valor completo fica no `title`).
+  const displayFileName = useMemo(() => {
+    if (!fileName) return '';
+    if (fileName.length <= 30) return fileName;
+    return `${fileName.slice(0, 27).trimEnd()}…`;
+  }, [fileName]);
+
   if (!fileType) {
     return (
       <div
@@ -1819,7 +1826,7 @@ export default function Reader() {
             initial={{ y: -100 }} 
             animate={{ y: 0 }} 
             exit={{ y: -100 }}
-            className={`fixed top-0 w-full px-2 sm:px-3 py-2 md:py-3 grid grid-cols-[auto_1fr_auto] items-center gap-2 md:gap-3 z-50 border-b backdrop-blur-md shadow-lg ${BAR_STYLES[theme].wrap}`}
+            className={`fixed top-0 w-full px-2 sm:px-3 py-2 md:py-3 grid grid-cols-[minmax(0,auto)_1fr_minmax(0,auto)] items-center gap-2 md:gap-3 z-50 border-b backdrop-blur-md shadow-lg ${BAR_STYLES[theme].wrap}`}
             onClick={(e) => e.stopPropagation()}
           >
             {/* Esquerda: Fechar + Nome do arquivo */}
@@ -1834,8 +1841,8 @@ export default function Reader() {
               >
                 <X className="w-5 h-5" />
               </button>
-              <span className={`font-medium text-xs sm:text-sm truncate min-w-0 flex-1 max-w-[30vw] sm:max-w-[180px] text-left ${BAR_STYLES[theme].text}`} title={fileName}>
-                {fileName}
+              <span className={`font-medium text-xs sm:text-sm truncate min-w-0 flex-1 max-w-[30vw] sm:max-w-[220px] text-left ${BAR_STYLES[theme].text}`} title={fileName}>
+                {displayFileName}
               </span>
             </div>
 
