@@ -1823,7 +1823,7 @@ export default function Reader() {
             onClick={(e) => e.stopPropagation()}
           >
             {/* Esquerda: Fechar + Nome do arquivo */}
-            <div className="flex items-center gap-1 sm:gap-2 min-w-0 max-w-[55vw] justify-self-start overflow-hidden">
+            <div className="flex items-center gap-1 sm:gap-2 min-w-0 max-w-[40vw] justify-self-start overflow-hidden">
               <button 
                 onClick={(e) => {
                   e.stopPropagation();
@@ -1840,7 +1840,7 @@ export default function Reader() {
             </div>
 
             {/* Centro: ferramentas de leitura */}
-            <div className="flex items-center justify-center gap-1 sm:gap-2 min-w-0 px-1">
+            <div className="flex items-center justify-center gap-1 sm:gap-2 min-w-0 max-w-full overflow-hidden px-1 justify-self-center">
               {/* Saltar para página */}
               <form
                 onSubmit={submitPageJump}
@@ -1894,7 +1894,7 @@ export default function Reader() {
               {fileType === 'epub' && (
                 <button
                   onClick={(e) => { e.stopPropagation(); speakEpub(); }}
-                  className={`w-7 h-7 sm:w-9 sm:h-9 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${isSpeaking ? 'bg-[#e8a766]/40' : BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
+                  className={`hidden min-[480px]:flex w-7 h-7 sm:w-9 sm:h-9 items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${isSpeaking ? 'bg-[#e8a766]/40' : BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
                   title={isSpeaking ? 'Parar leitura em voz alta' : 'Ler em voz alta (trecho atual)'}
                 >
                   <Volume2 className="w-4 h-4" />
@@ -1905,7 +1905,7 @@ export default function Reader() {
               {fileType === 'epub' && (
                 <button
                   onClick={(e) => { e.stopPropagation(); toggleEpubFlow(); }}
-                  className={`w-7 h-7 sm:w-9 sm:h-9 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
+                  className={`hidden min-[480px]:flex w-7 h-7 sm:w-9 sm:h-9 items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
                   title={epubFlow === 'paginated' ? 'Ativar rolagem contínua' : 'Voltar a páginas individuais'}
                 >
                   <ScrollText className="w-4 h-4" />
