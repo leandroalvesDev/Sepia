@@ -9,12 +9,12 @@ import {
   BookOpen, Moon, Sun, Coffee, 
   ChevronLeft, ChevronRight, X, Maximize, 
   Minimize, Loader2, ZoomIn, ZoomOut, Palette, Check, ArrowDown, Search,
-  Highlighter, Eraser
+  Highlighter, Eraser, CupSoda, ListTree, ScrollText, ChevronDown, FileDown, Volume2
 } from 'lucide-react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { idbPut, idbGet, idbDelete, FILE_STORE, COVER_STORE } from '../lib/db';
 
-type Theme = 'light' | 'dark' | 'sepia';
+type Theme = 'light' | 'dark' | 'sepia' | 'cafe';
 type FileType = 'image' | 'pdf' | 'epub' | null;
 type SearchStatus = 'idle' | 'searching' | 'done' | 'unsupported' | 'error';
 type HighlightKey = 'yellow' | 'green' | 'blue' | 'pink';
@@ -44,11 +44,15 @@ const FONT_MAX = 32;
 const FONT_DEFAULT = 16;
 const SEARCH_RESULT_LIMIT = 500;
 const HL_LOCAL_PREFIX = 'reader-highlights';
+const ZOOM_MIN = 1;
+const ZOOM_MAX = 4;
 
 const THEME_STYLES: Record<Theme, string> = {
   light: 'bg-gray-50 text-gray-900',
   dark: 'bg-black text-gray-300',
-  sepia: 'bg-[#F4ECD8] text-[#432c21]'
+  sepia: 'bg-[#F4ECD8] text-[#432c21]',
+  // Mesma identidade da landing page: marrom-escuro + dourado + bege.
+  cafe: 'bg-[#14110d] text-[#e8ddc8]'
 };
 
 // Overlay (topbar/barra flutuante) que segue o tema do app, em vez de
@@ -69,12 +73,18 @@ const BAR_STYLES: Record<Theme, { wrap: string; btn: string; text: string }> = {
     btn: 'hover:bg-[#432c21]/10 text-[#432c21]',
     text: 'text-[#432c21]',
   },
+  cafe: {
+    wrap: 'bg-[#14110d]/85 border-[#3a3226]/60',
+    btn: 'hover:bg-[#e8a766]/15 text-[#e8ddc8]',
+    text: 'text-[#e8ddc8]',
+  },
 };
 
 const SPINNER_STYLES: Record<Theme, string> = {
   light: 'text-gray-500',
   dark: 'text-gray-400',
   sepia: 'text-[#a0602d]',
+  cafe: 'text-[#e8a766]',
 };
 
 // Transição de folhear estilo Kindle (leve: apenas translateX + opacity, GPU-friendly)
@@ -112,17 +122,44 @@ export default function Reader() {
   const panY = useMotionValue(0);
   const pinchRef = useRef<{ dist: number; scale: number } | null>(null);
   const lastTapRef = useRef(0);
+  const wheelTurnAtRef = useRef(0);
 
   const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
-  const applyZoom = useCallback((next: number) => {
-    const z = clamp(next, 1, 4);
+  // Mantém a página dentro das próprias bordas no modo zoom (pan limitado).
+  const clampPan = useCallback((x: number, y: number) => {
+    const container = viewerRef.current;
+    const img = imgRef.current;
+    if (!container || !img) return { x, y };
+    const W = container.clientWidth;
+    const H = container.clientHeight;
+    const overflowX = Math.max(0, zoomRef.current * img.clientWidth - W);
+    const overflowY = Math.max(0, zoomRef.current * img.clientHeight - H);
+    return {
+      x: clamp(x, -overflowX / 2, overflowX / 2),
+      y: clamp(y, -overflowY / 2, overflowY / 2),
+    };
+  }, []);
+
+  // Aplica o zoom. Quando `anchor` é fornecido (rodinha do mouse), ajusta o
+  // pan para manter sob o cursor o mesmo ponto da página que havia antes.
+  const applyZoom = useCallback((next: number, anchor?: { x: number; y: number }) => {
+    const z = clamp(next, ZOOM_MIN, ZOOM_MAX);
     setZoom(z);
-    if (z === 1) {
+    zoomRef.current = z;
+    if (z === ZOOM_MIN) {
       panX.set(0);
       panY.set(0);
+      return;
     }
-  }, [panX, panY]);
+    const container = viewerRef.current;
+    const img = imgRef.current;
+    if (anchor && container && img) {
+      const p = clampPan(anchor.x, anchor.y);
+      panX.set(p.x);
+      panY.set(p.y);
+    }
+  }, [panX, panY, clampPan]);
 
   // Limites de translação (pan) para o modo zoom: impede arrastar a página
   // além das suas próprias bordas, evitando espaço vazio na tela.
@@ -150,7 +187,9 @@ export default function Reader() {
   const [theme, setTheme] = useState<Theme>(() => {
     if (typeof window === 'undefined') return 'sepia';
     const saved = localStorage.getItem('reader-theme') as Theme | null;
-    return saved === 'light' || saved === 'dark' || saved === 'sepia' ? saved : 'sepia';
+    // 'landing' era o nome antigo do tema café — migra automaticamente.
+    if ((saved as string) === 'landing') return 'cafe';
+    return saved === 'light' || saved === 'dark' || saved === 'sepia' || saved === 'cafe' ? saved : 'sepia';
   });
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showThemeMenu, setShowThemeMenu] = useState(false);
@@ -159,6 +198,31 @@ export default function Reader() {
   // ----- Ir para página -----
   const [pageInput, setPageInput] = useState('');
   const [epubPageTotal, setEpubPageTotal] = useState<number | null>(null);
+
+  // ----- Sumário (TOC) do EPUB -----
+  const [toc, setToc] = useState<Array<{ label: string; href: string; cfi?: string; subitems?: boolean }>>([]);
+  const [tocOpen, setTocOpen] = useState(false);
+  const tocRef = useRef<Array<{ label: string; href: string; cfi?: string; subitems?: boolean }>>([]);
+
+  // ----- Progresso de leitura do EPUB (relocated) -----
+  const [epubProgress, setEpubProgress] = useState(0);
+  const [epubTotalViaProgress, setEpubTotal] = useState(0);
+
+  // ----- Fluxo de leitura do EPUB: paginado (página única) ou rolando (scroll contínuo) -----
+  const [epubFlow, setEpubFlow] = useState<'paginated' | 'scrolled'>(() => {
+    if (typeof window === 'undefined') return 'paginated';
+    try {
+      const s = localStorage.getItem('reader-epub-flow');
+      return s === 'scrolled' ? 'scrolled' : 'paginated';
+    } catch { return 'paginated'; }
+  });
+  const epubFlowRef = useRef(epubFlow);
+  epubFlowRef.current = epubFlow;
+  const currentFileRef = useRef<File | null>(null);
+
+  // ----- Leitura em voz alta (TTS, local via Web Speech API) -----
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const speakingRef = useRef(false);
 
   // ----- Busca de texto (Ctrl+F) -----
   const [searchOpen, setSearchOpen] = useState(false);
@@ -251,6 +315,7 @@ export default function Reader() {
 
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
   const didDragRef = useRef(false);
+  const zoomRef = useRef(1);
   const renderTaskRef = useRef<any>(null);
   const loadingPagesRef = useRef<Set<number>>(new Set());
   const containerReadyRef = useRef(false);
@@ -342,6 +407,9 @@ export default function Reader() {
   }, [theme]);
 
   const closeFile = useCallback(() => {
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    speakingRef.current = false;
+    setIsSpeaking(false);
     if (renderTaskRef.current) {
       renderTaskRef.current.cancel();
       renderTaskRef.current = null;
@@ -489,7 +557,7 @@ export default function Reader() {
       height: "100%",
       spread: "none",
       manager: "continuous",
-      flow: "paginated",
+      flow: epubFlowRef.current,
     });
     
     renditionRef.current = rendition;
@@ -497,6 +565,7 @@ export default function Reader() {
     rendition.themes.register("light", { "body": { "background": "transparent", "color": "#111827" }});
     rendition.themes.register("dark", { "body": { "background": "transparent", "color": "#d1d5db" }});
     rendition.themes.register("sepia", { "body": { "background": "transparent", "color": "#432c21" }});
+    rendition.themes.register("cafe", { "body": { "background": "transparent", "color": "#e8ddc8" }});
     rendition.themes.select(theme);
     rendition.themes.fontSize(fontSize + 'px');
 
@@ -506,6 +575,13 @@ export default function Reader() {
     rendition.on("relocated", (location: any) => {
       if (location?.start?.cfi) {
         localStorage.setItem(progressKey, location.start.cfi);
+      }
+      if (bookRef.current?.locations?.length?.()) {
+        const total = bookRef.current.locations.length();
+        let percent = 0;
+        try { percent = bookRef.current.locations.percentageFromCfi(location?.start?.cfi) * 100; } catch { /* */ }
+        if (!Number.isNaN(percent)) setEpubProgress(Math.round(clamp(percent, 0, 100)));
+        setEpubTotal(total);
       }
     });
 
@@ -587,10 +663,26 @@ export default function Reader() {
     highlightsRef.current = savedHls;
     setHighlights(savedHls);
 
-    // Gera índices de "páginas" no fundo (para o salto de página em EPUB).
+    // Gera índices de "páginas" no fundo (para o salto de página em EPUB)
+    // e monta o sumário (TOC) a partir da navegação do livro.
     void (async () => {
       try {
         await book.ready;
+        const nav = book.navigation?.toc || [];
+        const flat = (items: any[], depth: number): Array<{ label: string; cfi?: string; href: string; depth: number }> => {
+          return (items || []).flatMap((n: any) => {
+            const label = typeof n.label === 'string' ? n.label : '';
+            const href = typeof n.href === 'string' ? n.href : '';
+            const cfi = n.cfi ?? n.hrefCfi ?? undefined;
+            const self = label ? [{ label, cfi, href, depth }] : [];
+            return [...self, ...flat(n.subitems, depth + 1)];
+          });
+        };
+        const flatToc = flat(nav, 0);
+        flatToc.forEach(x => {
+          tocRef.current.push({ label: x.label, href: x.href, cfi: x.cfi, subitems: x.depth > 0 });
+        });
+        setToc([...tocRef.current]);
         await book.locations.generate(1500);
         if (bookRef.current === book) setEpubPageTotal(book.locations.length());
       } catch { /* não determinístico p/ esse livro */ }
@@ -645,10 +737,10 @@ export default function Reader() {
 
   // Renderização sob demanda: renderiza a página alvo com escala que cabe na tela
   // (canvas enxuto = primeira página instantânea) e faz prefetch das vizinhas.
-  const renderPdfPage = useCallback(async (targetIndex: number, qualityScale?: number) => {
+  const renderPdfPage = useCallback(async (targetIndex: number, qualityScale?: number, force?: boolean) => {
     const pdf = pdfDocRef.current;
     if (!pdf || targetIndex < 0 || targetIndex >= pdf.numPages) return;
-    if (pagesRef.current[targetIndex]) return;
+    if (!force && pagesRef.current[targetIndex]) return;
     if (loadingPagesRef.current.has(targetIndex)) return;
 
     loadingPagesRef.current.add(targetIndex);
@@ -656,26 +748,23 @@ export default function Reader() {
     try {
       const page = await pdf.getPage(targetIndex + 1);
 
-      const renderScale = qualityScale ?? (() => {
-        const base = page.getViewport({ scale: 1 });
-        const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
-        // Mede o contêiner real (viewerRef) em vez de window, para nunca
-        // renderizar com dimensões zeradas quando o DOM ainda não montou.
-        const size = containerSizeRef.current
-          || (viewerRef.current
-            ? { w: viewerRef.current.clientWidth, h: viewerRef.current.clientHeight }
-            : null);
-        const containerW = (size && size.w > 0) ? size.w : (typeof window !== 'undefined' ? window.innerWidth : 400);
-        const containerH = (size && size.h > 0) ? size.h : (typeof window !== 'undefined' ? window.innerHeight : 800);
-        // Escala responsiva: cabe na tela inteira preservando a proporção.
-        // Em telas pequenas (celular) o fator limitante é a largura; no desktop, a altura.
-        const scaleByWidth = (containerW / base.width) * dpr;
-        const scaleByHeight = (containerH / base.height) * dpr;
-        const fitScale = Math.min(scaleByWidth, scaleByHeight);
-        // Canvas dimensionado para a tela (nítido e leve, sem exageros)
-        return Math.min(4, Math.max(1, fitScale));
-      })();
-
+      const base = page.getViewport({ scale: 1 });
+      const dpr = typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1;
+      // Mede o contêiner real (viewerRef) em vez de window, para nunca
+      // renderizar com dimensões zeradas quando o DOM ainda não montou.
+      const size = containerSizeRef.current
+        || (viewerRef.current
+          ? { w: viewerRef.current.clientWidth, h: viewerRef.current.clientHeight }
+          : null);
+      const containerW = (size && size.w > 0) ? size.w : (typeof window !== 'undefined' ? window.innerWidth : 400);
+      const containerH = (size && size.h > 0) ? size.h : (typeof window !== 'undefined' ? window.innerHeight : 800);
+      // Escala responsiva: cabe na tela inteira preservando a proporção.
+      // Em telas pequenas (celular) o fator limitante é a largura; no desktop, a altura.
+      const scaleByWidth = (containerW / base.width) * dpr;
+      const scaleByHeight = (containerH / base.height) * dpr;
+      const fitScale = Math.min(scaleByWidth, scaleByHeight);
+      // Com zoom, multiplica a escala de encaixe (limite 8x p/ não explodir memória).
+      const renderScale = Math.min(8, Math.max(1, fitScale * (qualityScale ?? 1)));
       const viewport = page.getViewport({ scale: renderScale });
       const canvas = document.createElement('canvas');
       const context = canvas.getContext('2d');
@@ -701,8 +790,9 @@ export default function Reader() {
         if (blob && !renderAbortRef.current) {
           const url = URL.createObjectURL(blob);
           setPages(prev => {
-            if (prev[targetIndex]) return prev;
+            if (!force && prev[targetIndex]) return prev;
             const newPages = [...prev];
+            if (force && newPages[targetIndex]) URL.revokeObjectURL(newPages[targetIndex]);
             newPages[targetIndex] = url;
             return newPages;
           });
@@ -780,6 +870,18 @@ export default function Reader() {
     return () => { cancelled = true; };
   }, [currentIndex, fileType, renderPdfPage, pdfReady]);
 
+  // Enquanto houver zoom no PDF, re-renderiza a página atual numa resolução
+  // maior (origem multiplicada por zoom), para o texto não ficar borrado.
+  useEffect(() => {
+    if (fileType !== 'pdf' || !pdfDocRef.current) return;
+    if (zoom <= ZOOM_MIN + 0.02) return;
+    const t = setTimeout(() => {
+      if (renderAbortRef.current || !pdfDocRef.current) return;
+      void renderPdfPage(currentIndex, zoom, true);
+    }, 240);
+    return () => clearTimeout(t);
+  }, [zoom, fileType, currentIndex, renderPdfPage]);
+
   // Renderização sob demanda de CBZ: página atual + vizinhas conforme navega.
   useEffect(() => {
     if (fileType !== 'image' || !cbzRef.current.images.length) return;
@@ -793,6 +895,7 @@ export default function Reader() {
   const loadBook = useCallback(async (file: File, fromLibrary: boolean) => {
     setIsLoading(true);
     setFileName(file.name);
+    currentFileRef.current = file;
 
     try {
       let initialPages: string[] = [];
@@ -858,6 +961,67 @@ export default function Reader() {
     }
   }, [closeFile, loadBook, library]);
 
+  // Alterna fluxo de leitura do EPUB (paginado <-> rolagem contínua), recarregando o arquivo.
+  const toggleEpubFlow = useCallback(() => {
+    const next = epubFlowRef.current === 'paginated' ? 'scrolled' : 'paginated';
+    epubFlowRef.current = next;
+    localStorage.setItem('reader-epub-flow', next);
+    setEpubFlow(next);
+    const file = currentFileRef.current;
+    if (file && fileType === 'epub') {
+      closeFile();
+      void loadBook(file, false);
+    }
+  }, [fileType, closeFile, loadBook]);
+
+  // Lê em voz alta o capítulo/trecho atual do EPUB (voz do navegador, sem servidor).
+  const speakEpub = useCallback(async () => {
+    const book = bookRef.current;
+    const rendition = renditionRef.current;
+    if (!book || !rendition || fileType !== 'epub') return;
+    if (!('speechSynthesis' in window)) { showFlash('Navegador sem suporte a leitura em voz alta.'); return; }
+
+    if (speakingRef.current) {
+      window.speechSynthesis.cancel();
+      speakingRef.current = false;
+      setIsSpeaking(false);
+      return;
+    }
+
+    let startCfi: string | undefined;
+    try { startCfi = rendition.location?.start?.cfi; } catch { /* */ }
+
+    let text = '';
+    try {
+      if (startCfi) {
+        const section = await book.getRange(startCfi);
+        text = section?.toString() || '';
+      }
+    } catch { /* current chapter unavailable */ }
+    if (!text.trim()) { showFlash('Não há texto para ler neste ponto.'); return; }
+
+    const cleaned = text
+      .replace(/\s+/g, ' ')
+      .replace(/[“”]/g, '"')
+      .trim();
+
+    const utterance = new SpeechSynthesisUtterance(cleaned);
+    utterance.lang = 'pt-BR';
+    utterance.rate = 1;
+    utterance.onend = () => { speakingRef.current = false; setIsSpeaking(false); };
+    utterance.onerror = () => { speakingRef.current = false; setIsSpeaking(false); };
+    speakingRef.current = true;
+    setIsSpeaking(true);
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+  }, [fileType, showFlash]);
+
+  const stopTts = useCallback(() => {
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    speakingRef.current = false;
+    setIsSpeaking(false);
+  }, []);
+
   // Remove um livro da biblioteca (arquivo + capa do IDB + registro + progresso).
   const removeFromLibrary = useCallback((name: string) => {
     void idbDelete(FILE_STORE, name).catch(() => {});
@@ -902,6 +1066,42 @@ export default function Reader() {
       setCurrentIndex(prev => prev - 1);
     }
   }, [currentIndex, fileType, applyZoom]);
+
+  // Rodinha do mouse / pinça do trackpad:
+  //  - Ctrl+wheel → zoom a partir do ponto sob o cursor;
+  //  - com zoom ativo → roda arrasta a página (pan);
+  //  - sem zoom → roda vira as páginas.
+  useEffect(() => {
+    if (fileType === 'epub' || fileType === null) return;
+    const el = viewerRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const cur = zoomRef.current;
+      if (e.ctrlKey || e.metaKey) {
+        const next = clamp(cur * Math.exp(-e.deltaY * 0.0025), ZOOM_MIN, ZOOM_MAX);
+        const rect = el.getBoundingClientRect();
+        const px = e.clientX - (rect.left + rect.width / 2);
+        const py = e.clientY - (rect.top + rect.height / 2);
+        const ratio = next / cur;
+        applyZoom(next, { x: px - ratio * (px - panX.get()), y: py - ratio * (py - panY.get()) });
+        return;
+      }
+      if (cur > ZOOM_MIN) {
+        const p = clampPan(panX.get() - e.deltaX, panY.get() - e.deltaY);
+        panX.set(p.x);
+        panY.set(p.y);
+        return;
+      }
+      const now = Date.now();
+      if (now - wheelTurnAtRef.current < 450) return;
+      if (Math.abs(e.deltaY) < 30 && Math.abs(e.deltaX) < 30) return;
+      if (e.deltaY > 0 || e.deltaX > 0) goToNext(); else goToPrev();
+      wheelTurnAtRef.current = now;
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [fileType, applyZoom, clampPan, goToNext, goToPrev, panX, panY]);
 
   const toggleUi = () => setIsUiVisible(!isUiVisible);
 
@@ -963,6 +1163,27 @@ export default function Reader() {
     setPageInput('');
   }, [pageInput, pageJumpTotal, goToPageNum, showFlash]);
 
+  // Salta para uma porcentagem de leitura no EPUB (0–100) via slider.
+  const seekEpubPercent = useCallback((percent: number) => {
+    const book = bookRef.current;
+    const rendition = renditionRef.current;
+    if (!book || !rendition || fileType !== 'epub') return;
+    const p = clamp(percent, 0, 100);
+    setEpubProgress(p);
+    if (book.locations && book.locations.length() > 1) {
+      try {
+        const cfi = book.locations.cfiFromPercentage(p / 100);
+        if (cfi) { rendition.display(cfi); return; }
+      } catch { /* fallback abaixo */ }
+    }
+    const spineLen = (book.spine as unknown as { length?: number } | undefined)?.length || 0;
+    if (spineLen > 0) {
+      const idx = clamp(Math.floor((p / 100) * spineLen), 0, spineLen - 1);
+      const section = book.spine.get(idx);
+      if (section) rendition.display(section.cfiBase);
+    }
+  }, [fileType]);
+
   // ----- Busca de texto (Ctrl+F) -----
   const snippetFromMatch = useCallback((text: string, start: number, end: number) => {
     const RADIUS = 46;
@@ -989,6 +1210,16 @@ export default function Reader() {
     setSearchStatus('idle');
     setIsUiVisible(false);
   }, [applyZoom]);
+
+  const jumpToToc = useCallback((item: { label: string; href: string; cfi?: string }) => {
+    if (renditionRef.current) {
+      const cfi = item.cfi || (item.href ? `epubcfi(${item.href})` : undefined);
+      if (cfi) renditionRef.current.display(cfi).catch(() => {});
+      else if (item.href) renditionRef.current.display(item.href).catch(() => {});
+    }
+    setTocOpen(false);
+    setIsUiVisible(false);
+  }, []);
 
   const runSearch = useCallback(async (query: string) => {
     const q = query.trim();
@@ -1229,6 +1460,33 @@ export default function Reader() {
     hlPopoverRef.current = null;
   }, [fileName, clearContentsSelection, rangesOverlap, saveHighlights, showFlash]);
 
+  // Exporta os grifos do EPUB como um arquivo Markdown (privado, só local).
+  const exportHighlights = useCallback(async () => {
+    const book = bookRef.current;
+    const list = highlightsRef.current;
+    if (!book || list.length === 0) { showFlash('Nenhum grifo para exportar.'); return; }
+
+    const lines: string[] = [`# Grifos — ${fileName}`, ''];
+    for (const h of list) {
+      let text = '';
+      try { text = (book.getRange(h.cfi)?.toString() || '').replace(/\s+/g, ' ').trim(); } catch { /* cfi órfão */ }
+      const label = HIGHLIGHT_COLORS[h.color].label;
+      if (text) lines.push(`- **(${label})** ${text}`);
+      else lines.push(`- **(${label})** _[trecho não recuperável: ${h.cfi}]_`);
+    }
+
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(fileName || 'grifos').replace(/\.[a-z0-9]+$/i, '')}-grifos.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showFlash(`${list.length} grifo(s) exportado(s).`);
+  }, [fileName, showFlash]);
+
   useEffect(() => {
     if (fileName && pages.length > 0 && fileType !== 'epub') {
       localStorage.setItem(`reader-progress-${fileName}`, currentIndex.toString());
@@ -1246,6 +1504,31 @@ export default function Reader() {
         }
         return;
       }
+      // Ctrl/Cmd+G → ir para página (também 'g' simples).
+      if (((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'g') || (e.key.toLowerCase() === 'g' && !e.ctrlKey && !e.metaKey && !searchOpenRef.current)) {
+        if (!fileType) return;
+        e.preventDefault();
+        setIsUiVisible(true);
+        const el = document.getElementById('page-jump-input') as HTMLInputElement | null;
+        setTimeout(() => { el?.focus(); el?.select(); }, 60);
+        return;
+      }
+      // Ctrl/Cmd + '+' / '-' → zoom (PDF/CBZ), fonte (EPUB).
+      if (e.ctrlKey || e.metaKey) {
+        const k = e.key.toLowerCase();
+        if (k === '=' || k === '+') {
+          e.preventDefault();
+          if (fileType === 'epub') setFontSize(prev => clamp(prev + 1, FONT_MIN, FONT_MAX));
+          else applyZoom(zoomRef.current + 0.25);
+          return;
+        }
+        if (k === '-' || k === '_') {
+          e.preventDefault();
+          if (fileType === 'epub') setFontSize(prev => clamp(prev - 1, FONT_MIN, FONT_MAX));
+          else applyZoom(zoomRef.current - 0.25);
+          return;
+        }
+      }
       if (e.key === 'Escape' && searchOpenRef.current) {
         e.preventDefault();
         setSearchOpen(false);
@@ -1261,6 +1544,12 @@ export default function Reader() {
       }
       if (e.key === 'ArrowRight') goToNext();
       if (e.key === 'ArrowLeft') goToPrev();
+      // '+'/'-' ou '1' reiniciam/ajustam o zoom (PDF/CBZ) sem Ctrl.
+      if (!e.ctrlKey && !e.metaKey && fileType && fileType !== 'epub') {
+        if (e.key === '+' || e.key === '=') { e.preventDefault(); applyZoom(zoomRef.current + 0.25); return; }
+        if (e.key === '-' || e.key === '_') { e.preventDefault(); applyZoom(zoomRef.current - 0.25); return; }
+        if (e.key === '1') { e.preventDefault(); applyZoom(ZOOM_MIN); return; }
+      }
       if (e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.metaKey) {
         e.preventDefault();
         if (!document.fullscreenElement) document.documentElement.requestFullscreen();
@@ -1479,6 +1768,10 @@ export default function Reader() {
                 <div className="border border-[#3a3226] divide-y divide-[#3a3226] text-sm">
                   {[
                     { k: '← / →', a: 'página anterior / próxima' },
+                    { k: 'ctrl+g / g', a: 'ir para página' },
+                    { k: 'ctrl+f', a: 'busca no texto' },
+                    { k: 'ctrl± / ±', a: 'zoom (PDF/CBZ) · fonte (EPUB)' },
+                    { k: '1', a: 'resetar zoom' },
                     { k: 'f', a: 'tela cheia' },
                     { k: 'esc', a: 'mostrar interface' },
                     { k: 'toque lateral', a: 'virar página (mobile)' },
@@ -1555,6 +1848,7 @@ export default function Reader() {
                 className={`flex items-center gap-0.5 sm:gap-1 h-8 sm:h-9 px-1.5 sm:px-2 rounded-full ring-1 ring-black/5 shadow-sm ${BAR_STYLES[theme].wrap}`}
               >
                 <input
+                  id="page-jump-input"
                   value={pageInput}
                   onChange={(e) => setPageInput(e.target.value)}
                   inputMode="numeric"
@@ -1573,6 +1867,17 @@ export default function Reader() {
                 </button>
               </form>
 
+              {/* Sumário (EPUB) */}
+              {fileType === 'epub' && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); setTocOpen(v => !v); }}
+                  className={`w-7 h-7 sm:w-9 sm:h-9 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${tocOpen ? 'bg-[#e8a766]/30' : BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
+                  title="Sumário (capítulos)"
+                >
+                  <ListTree className="w-4 h-4" />
+                </button>
+              )}
+
               {/* Busca (Ctrl+F) */}
               <button
                 onClick={(e) => {
@@ -1584,6 +1889,28 @@ export default function Reader() {
               >
                 <Search className="w-4 h-4" />
               </button>
+
+              {/* Leitura em voz alta (EPUB) */}
+              {fileType === 'epub' && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); speakEpub(); }}
+                  className={`w-7 h-7 sm:w-9 sm:h-9 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${isSpeaking ? 'bg-[#e8a766]/40' : BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
+                  title={isSpeaking ? 'Parar leitura em voz alta' : 'Ler em voz alta (trecho atual)'}
+                >
+                  <Volume2 className="w-4 h-4" />
+                </button>
+              )}
+
+              {/* Fluxo de leitura (EPUB): páginas individuais <-> rolagem contínua */}
+              {fileType === 'epub' && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); toggleEpubFlow(); }}
+                  className={`w-7 h-7 sm:w-9 sm:h-9 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
+                  title={epubFlow === 'paginated' ? 'Ativar rolagem contínua' : 'Voltar a páginas individuais'}
+                >
+                  <ScrollText className="w-4 h-4" />
+                </button>
+              )}
 
               {/* Tamanho de fonte (EPUB) */}
               {fileType === 'epub' && (
@@ -1612,13 +1939,14 @@ export default function Reader() {
             {/* Direita: Utilitários */}
             <div className="flex items-center gap-1 sm:gap-2 min-w-0 justify-self-end">
               {fileType !== 'epub' && (
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-0.5 sm:gap-1" title="Zoom (Ctrl+rodinha ou trackpad)">
                   <button 
                     onClick={(e) => {
                       e.stopPropagation();
-                      applyZoom(zoom - 0.5);
+                      applyZoom(zoom - 0.25);
                     }} 
-                    className={`w-6 h-6 sm:w-9 sm:h-9 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`} 
+                    disabled={zoom <= ZOOM_MIN}
+                    className={`w-6 h-6 sm:w-8 sm:h-8 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0 disabled:opacity-30 disabled:pointer-events-none`} 
                     title="Diminuir zoom"
                   >
                     <ZoomOut className="w-4 h-4" />
@@ -1626,19 +1954,20 @@ export default function Reader() {
                   <button 
                     onClick={(e) => {
                       e.stopPropagation();
-                      applyZoom(zoom > 1 ? 1 : 2);
+                      if (zoom > ZOOM_MIN) applyZoom(ZOOM_MIN);
                     }} 
-                    className={`w-6 h-6 sm:w-9 sm:h-9 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0 text-[10px] font-semibold`}
-                    title="Restaurar zoom"
+                    className={`w-10 h-6 sm:w-12 sm:h-8 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0 text-[10px] sm:text-[11px] font-semibold tabular-nums`}
+                    title="Restaurar zoom (100%)"
                   >
-                    {zoom > 1 ? '1x' : '2x'}
+                    {Math.round(zoom * 100)}%
                   </button>
                   <button 
                     onClick={(e) => {
                       e.stopPropagation();
-                      applyZoom(zoom + 0.5);
+                      applyZoom(zoom + 0.25);
                     }} 
-                    className={`w-6 h-6 sm:w-9 sm:h-9 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`} 
+                    disabled={zoom >= ZOOM_MAX}
+                    className={`w-6 h-6 sm:w-8 sm:h-8 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0 disabled:opacity-30 disabled:pointer-events-none`} 
                     title="Aumentar zoom"
                   >
                     <ZoomIn className="w-4 h-4" />
@@ -1662,13 +1991,24 @@ export default function Reader() {
                   e.stopPropagation();
                   copyPix();
                 }}
-                className="hidden sm:flex items-center gap-1.5 px-3 h-9 rounded-full shadow-sm bg-zinc-800 text-white hover:bg-zinc-700 active:scale-95 transition-all flex-shrink-0"
+                className={`hidden sm:flex items-center gap-1.5 px-3 h-9 rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
                 title="Apoiar com Pix"
               >
                 {pixCopied ? <Check className="w-4 h-4 text-green-400" /> : <Coffee className="w-4 h-4" />}
                 <span className="text-xs font-semibold hidden sm:inline">{pixCopied ? 'Chave Copiada!' : 'Apoiar'}</span>
               </button>
               
+              {fileType === 'epub' && highlights.length > 0 && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); exportHighlights(); }}
+                  className={`hidden sm:flex items-center gap-1.5 px-3 h-9 rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
+                  title="Exportar grifos (Markdown)"
+                >
+                  <FileDown className="w-4 h-4" />
+                  <span className="text-xs font-semibold hidden sm:inline">Exportar Grifos</span>
+                </button>
+              )}
+
               <div className="relative flex-shrink-0">
                 <button
                   onClick={(e) => {
@@ -1687,6 +2027,7 @@ export default function Reader() {
                       onClick={(e) => { e.stopPropagation(); setShowThemeMenu(false); }}
                     />
                     <div className={`absolute right-0 top-full mt-2 z-50 flex flex-col gap-1 p-1.5 rounded-xl shadow-lg backdrop-blur-md border ${BAR_STYLES[theme].wrap} bg-opacity-100`}>
+                      <button onClick={(e) => { e.stopPropagation(); setTheme('cafe'); setShowThemeMenu(false); }} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${theme === 'cafe' ? 'bg-[#e8a766]/30' : BAR_STYLES[theme].btn} hover:shadow-sm transition-all text-xs font-medium`}><CupSoda className="w-4 h-4" /> Café</button>
                       <button onClick={(e) => { e.stopPropagation(); setTheme('light'); setShowThemeMenu(false); }} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${theme === 'light' ? 'bg-[#e8a766]/30' : BAR_STYLES[theme].btn} hover:shadow-sm transition-all text-xs font-medium`}><Sun className="w-4 h-4" /> Claro</button>
                       <button onClick={(e) => { e.stopPropagation(); setTheme('sepia'); setShowThemeMenu(false); }} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${theme === 'sepia' ? 'bg-[#e8a766]/30' : BAR_STYLES[theme].btn} hover:shadow-sm transition-all text-xs font-medium`}><BookOpen className="w-4 h-4" /> Sépia</button>
                       <button onClick={(e) => { e.stopPropagation(); setTheme('dark'); setShowThemeMenu(false); }} className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${theme === 'dark' ? 'bg-[#e8a766]/30' : BAR_STYLES[theme].btn} hover:shadow-sm transition-all text-xs font-medium`}><Moon className="w-4 h-4" /> Escuro</button>
@@ -1781,6 +2122,54 @@ export default function Reader() {
         </motion.div>
       )}
 
+      {/* Painel de sumário (TOC) do EPUB */}
+      <AnimatePresence>
+        {tocOpen && fileType === 'epub' && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="fixed top-14 md:top-16 left-1/2 -translate-x-1/2 w-[min(92vw,440px)] z-[54] px-2"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className={`rounded-2xl shadow-2xl border backdrop-blur-md overflow-hidden ${BAR_STYLES[theme].wrap}`}>
+              <div className="flex items-center gap-2 px-3 py-2.5 border-b border-black/10">
+                <ListTree className={`w-4 h-4 flex-shrink-0 ${BAR_STYLES[theme].text} opacity-50`} />
+                <span className={`flex-1 text-sm font-semibold ${BAR_STYLES[theme].text}`}>Sumário</span>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setTocOpen(false); }}
+                  className={`w-7 h-7 flex items-center justify-center rounded-full ${BAR_STYLES[theme].btn} active:scale-90 transition-all flex-shrink-0`}
+                  title="Fechar sumário"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="max-h-[48vh] overflow-y-auto p-2 overscroll-contain">
+                {toc.length === 0 ? (
+                  <p className="px-2 py-3 text-xs opacity-60">Este EPUB não possui sumário (índice de capítulos).</p>
+                ) : (
+                  <ul className="flex flex-col gap-0.5">
+                    {toc.map((item, i) => (
+                      <li key={i}>
+                        <button
+                          onClick={() => jumpToToc(item)}
+                          className={`w-full text-left px-2 py-1.5 rounded-lg ${item.subitems ? 'pl-6' : ''} ${BAR_STYLES[theme].btn} active:scale-[0.99] transition-all`}
+                        >
+                        <span className={`text-xs ${item.subitems ? 'opacity-70' : 'font-semibold'} ${BAR_STYLES[theme].text}`}>
+                          {item.subitems && <ChevronDown className="inline w-3 h-3 mr-1 opacity-50" />}
+                          {item.label}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Popover contextual de grifos (EPUB) */}
       <AnimatePresence>
         {hlPopover && (
@@ -1835,11 +2224,11 @@ export default function Reader() {
       </AnimatePresence>
 
       {/* Barra de progresso de leitura (sutil) */}
-      {fileType !== 'epub' && pages.length > 0 && (
+      {(fileType !== 'epub' ? pages.length > 0 : epubTotalViaProgress > 0) && (
         <div className="fixed top-0 left-0 right-0 z-40 h-0.5 bg-black/10">
           <div
             className="h-full bg-[#e8a766] transition-[width] duration-300 ease-out"
-            style={{ width: `${((currentIndex + 1) / pages.length) * 100}%` }}
+            style={{ width: `${fileType === 'epub' ? epubProgress : ((currentIndex + 1) / pages.length) * 100}%` }}
           />
         </div>
       )}
@@ -1863,9 +2252,25 @@ export default function Reader() {
               >
                 <ChevronLeft className="w-4 h-4" />
               </button>
-              <span className={`text-xs font-semibold tracking-wide min-w-[75px] sm:min-w-[95px] text-center ${BAR_STYLES[theme].text}`}>
-                {fileType === 'epub' ? 'eBook' : `Pg ${currentIndex + 1}/${pages.length}`}
-              </span>
+              {fileType === 'epub' ? (
+                <div className="flex items-center gap-2 px-1 select-none" title="Progresso de leitura">
+                  <span className={`text-[10px] font-mono opacity-70 min-w-[34px] text-right ${BAR_STYLES[theme].text}`}>{epubProgress}%</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={epubProgress}
+                    onChange={(e) => { e.stopPropagation(); seekEpubPercent(Number(e.target.value)); }}
+                    className="w-28 sm:w-40 accent-[#e8a766] cursor-pointer"
+                    aria-label="Progresso de leitura"
+                  />
+                  <span className={`hidden sm:block text-[10px] font-mono opacity-70 ${BAR_STYLES[theme].text}`}>eBook</span>
+                </div>
+              ) : (
+                <span className={`text-xs font-semibold tracking-wide min-w-[75px] sm:min-w-[95px] text-center ${BAR_STYLES[theme].text}`}>
+                  {`Pg ${currentIndex + 1}/${pages.length}`}
+                </span>
+              )}
               <button
                 onClick={(e) => { e.stopPropagation(); goToNext(); }}
                 disabled={fileType !== 'epub' && currentIndex === pages.length - 1}
@@ -1982,7 +2387,7 @@ export default function Reader() {
                   animate="center"
                   exit="exit"
                   style={{ gridArea: 'stack' }}
-                  className="w-full max-w-full overflow-hidden flex justify-center items-center"
+                  className="w-full max-w-full overflow-hidden flex justify-center items-center relative"
                 >
                   <img 
                     ref={imgRef}
