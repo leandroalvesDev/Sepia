@@ -1,6 +1,6 @@
 ﻿'use client';
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import JSZip from 'jszip';
 import ePub, { Book, Rendition } from 'epubjs';
 import { useDropzone } from 'react-dropzone';
@@ -8,13 +8,42 @@ import { motion, AnimatePresence, useMotionValue } from 'framer-motion';
 import { 
   BookOpen, Moon, Sun, Coffee, 
   ChevronLeft, ChevronRight, X, Maximize, 
-  Minimize, Loader2, ZoomIn, ZoomOut, Palette, Check, ArrowDown
+  Minimize, Loader2, ZoomIn, ZoomOut, Palette, Check, ArrowDown, Search,
+  Highlighter, Eraser
 } from 'lucide-react';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { idbPut, idbGet, idbDelete, FILE_STORE, COVER_STORE } from '../lib/db';
 
 type Theme = 'light' | 'dark' | 'sepia';
 type FileType = 'image' | 'pdf' | 'epub' | null;
+type SearchStatus = 'idle' | 'searching' | 'done' | 'unsupported' | 'error';
+type HighlightKey = 'yellow' | 'green' | 'blue' | 'pink';
+
+type SearchResult = {
+  id: string;
+  label: string;
+  context: string;
+  pdfPageIndex?: number;
+  cfi?: string;
+};
+
+type HighlightEntry = {
+  cfi: string;
+  color: HighlightKey;
+};
+
+const HIGHLIGHT_COLORS: Record<HighlightKey, { label: string; fill: string; opacity: number; swatch: string }> = {
+  yellow: { label: 'Amarelo', fill: '#FFD54A', opacity: 0.5, swatch: '#FFD54A' },
+  green: { label: 'Verde', fill: '#7BC96F', opacity: 0.5, swatch: '#7BC96F' },
+  blue: { label: 'Azul', fill: '#6FC8E8', opacity: 0.5, swatch: '#6FC8E8' },
+  pink: { label: 'Rosa', fill: '#F48FB1', opacity: 0.5, swatch: '#F48FB1' },
+};
+
+const FONT_MIN = 12;
+const FONT_MAX = 32;
+const FONT_DEFAULT = 16;
+const SEARCH_RESULT_LIMIT = 500;
+const HL_LOCAL_PREFIX = 'reader-highlights';
 
 const THEME_STYLES: Record<Theme, string> = {
   light: 'bg-gray-50 text-gray-900',
@@ -127,6 +156,31 @@ export default function Reader() {
   const [showThemeMenu, setShowThemeMenu] = useState(false);
   const [pdfReady, setPdfReady] = useState(false);
 
+  // ----- Ir para página -----
+  const [pageInput, setPageInput] = useState('');
+  const [epubPageTotal, setEpubPageTotal] = useState<number | null>(null);
+
+  // ----- Busca de texto (Ctrl+F) -----
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchStatus, setSearchStatus] = useState<SearchStatus>('idle');
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // ----- Tamanho de fonte (EPUB) -----
+  const [fontSize, setFontSize] = useState(() => {
+    if (typeof window === 'undefined') return FONT_DEFAULT;
+    const saved = Number(localStorage.getItem('reader-font-size'));
+    return isFinite(saved) && saved >= FONT_MIN && saved <= FONT_MAX ? saved : FONT_DEFAULT;
+  });
+
+  // ----- Grifar texto (EPUB) -----
+  const [highlights, setHighlights] = useState<HighlightEntry[]>([]);
+  const [hlPopover, setHlPopover] = useState<{ x: number; y: number; cfi: string } | null>(null);
+
+  // ----- Feedback discreto (toast) -----
+  const [flashMsg, setFlashMsg] = useState<string | null>(null);
+
   // ----- Pix & Biblioteca -----
   const PIX_KEY = '8e408492-8ef8-45b9-beaa-020d08e066ae';
   const [pixCopied, setPixCopied] = useState(false);
@@ -208,6 +262,9 @@ export default function Reader() {
   const pagesRef = useRef<string[]>([]);
   useEffect(() => { pagesRef.current = pages; }, [pages]);
   
+  const searchOpenRef = useRef(false);
+  useEffect(() => { searchOpenRef.current = searchOpen; }, [searchOpen]);
+  
   const currentIndexRef = useRef(0);
   useEffect(() => { currentIndexRef.current = currentIndex; }, [currentIndex]);
   
@@ -215,6 +272,13 @@ export default function Reader() {
   const renditionRef = useRef<Rendition | null>(null);
   const viewerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
+
+  const searchNonceRef = useRef(0);
+  const pdfTextCacheRef = useRef<string[]>([]);
+  const highlightsRef = useRef<HighlightEntry[]>([]);
+  const hlPopoverRef = useRef<{ x: number; y: number; cfi: string } | null>(null);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const highlightsKeyRef = useRef('');
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -267,6 +331,13 @@ export default function Reader() {
   }, [theme, fileType]);
 
   useEffect(() => {
+    try { localStorage.setItem('reader-font-size', String(fontSize)); } catch { /* ignore */ }
+    if (renditionRef.current && fileType === 'epub') {
+      renditionRef.current.themes.fontSize(fontSize + 'px');
+    }
+  }, [fontSize, fileType]);
+
+  useEffect(() => {
     try { localStorage.setItem('reader-theme', theme); } catch { /* ignore */ }
   }, [theme]);
 
@@ -302,6 +373,58 @@ export default function Reader() {
     setFileType(null);
     setFileName('');
     setIsUiVisible(true);
+
+    // Limpa estado das novas funcionalidades
+    searchNonceRef.current += 1;
+    pdfTextCacheRef.current = [];
+    setSearchOpen(false);
+    setSearchQuery('');
+    setSearchResults([]);
+    setSearchStatus('idle');
+    setPageInput('');
+    setEpubPageTotal(null);
+    setHighlights([]);
+    highlightsRef.current = [];
+    setHlPopover(null);
+    hlPopoverRef.current = null;
+    highlightsKeyRef.current = '';
+  }, []);
+
+  // ----- Helpers utilitários -----
+  const escapeRegExp = useCallback((value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), []);
+
+  const showFlash = useCallback((msg: string) => {
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    setFlashMsg(msg);
+    flashTimerRef.current = setTimeout(() => setFlashMsg(null), 2400);
+  }, []);
+
+  const loadHighlights = useCallback((name: string): HighlightEntry[] => {
+    try {
+      const raw = localStorage.getItem(`${HL_LOCAL_PREFIX}-${name}`);
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((h): h is HighlightEntry =>
+        !!h && typeof h.cfi === 'string' && !!HIGHLIGHT_COLORS[h.color as HighlightKey]
+      );
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const saveHighlights = useCallback((name: string, list: HighlightEntry[]) => {
+    try {
+      localStorage.setItem(`${HL_LOCAL_PREFIX}-${name}`, JSON.stringify(list));
+    } catch { /* quota/privado indisponível */ }
+  }, []);
+
+  // Fragmenta o texto extraído de uma página de PDF em uma string pesquisável.
+  const flattenPdfText = useCallback((items: Array<{ str?: string }>) => {
+    return items
+      .map(it => (it && typeof it.str === 'string' ? it.str : ''))
+      .join(' ')
+      .replace(/[\t\u00a0\u2000-\u200a\u3000]+/g, ' ')
+      .replace(/[ ]{2,}/g, ' ');
   }, []);
 
   const processCBZ = async (file: File) => {
@@ -375,6 +498,7 @@ export default function Reader() {
     rendition.themes.register("dark", { "body": { "background": "transparent", "color": "#d1d5db" }});
     rendition.themes.register("sepia", { "body": { "background": "transparent", "color": "#432c21" }});
     rendition.themes.select(theme);
+    rendition.themes.fontSize(fontSize + 'px');
 
     const progressKey = `reader-progress-${file.name}`;
     const savedCfi = localStorage.getItem(progressKey);
@@ -384,7 +508,93 @@ export default function Reader() {
         localStorage.setItem(progressKey, location.start.cfi);
       }
     });
-    rendition.on("click", () => setIsUiVisible(prev => !prev));
+
+    // Clique vira página/alterna UI, mas nunca durante seleção de texto/grifo.
+    rendition.on("click", () => {
+      if (hlPopoverRef.current) return;
+      try {
+        const views = (renditionRef.current?.views?.() || []) as Array<{ contents?: { window?: Window } }>;
+        for (const view of views) {
+          const sel = view?.contents?.window?.getSelection?.();
+          if (sel && sel.rangeCount && !sel.getRangeAt(0).collapsed) return;
+        }
+      } catch { /* ignore */ }
+      setIsUiVisible(prev => !prev);
+    });
+
+    // Texto selecionado → abre o popover de grifos.
+    rendition.on("selected", (cfiRange: string, contents: any) => {
+      if (!cfiRange || !contents) return;
+      try {
+        const sel = contents?.window?.getSelection?.();
+        let x = Math.round(window.innerWidth / 2);
+        let y = 110;
+        if (sel && sel.rangeCount && !sel.getRangeAt(0).collapsed) {
+          const rect = sel.getRangeAt(0).getBoundingClientRect();
+          const frame = contents?.window?.frameElement as HTMLElement | null;
+          if (frame) {
+            const fr = frame.getBoundingClientRect();
+            x = fr.left + rect.left + rect.width / 2;
+            y = fr.top + rect.top;
+          }
+          x = clamp(Math.round(x), 90, Math.round(window.innerWidth) - 90);
+          y = clamp(Math.round(y), 64, Math.max(64, Math.round(window.innerHeight) - 180));
+          const next = { x, y, cfi: cfiRange };
+          hlPopoverRef.current = next;
+          setHlPopover(next);
+        }
+      } catch { /* ignore */ }
+    });
+
+    // Tocar em um grifo existente também abre o popover (para remover).
+    rendition.on("markClicked", (cfiRange: string, _data: any, contents: any) => {
+      if (!cfiRange) return;
+      try {
+        const contentsTarget: any = contents || rendition.getContents();
+        const range = contentsTarget?.range?.(cfiRange);
+        const rect = range?.getBoundingClientRect?.();
+        const frame = contentsTarget?.window?.frameElement as HTMLElement | null;
+        let x = Math.round(window.innerWidth / 2);
+        let y = 110;
+        if (rect && frame) {
+          const fr = frame.getBoundingClientRect();
+          x = fr.left + rect.left + rect.width / 2;
+          y = fr.top + rect.top;
+        }
+        x = clamp(Math.round(x), 90, Math.round(window.innerWidth) - 90);
+        y = clamp(Math.round(y), 64, Math.max(64, Math.round(window.innerHeight) - 180));
+        const next = { x, y, cfi: cfiRange };
+        hlPopoverRef.current = next;
+        setHlPopover(next);
+      } catch { /* ignore */ }
+    });
+
+    // Restaura grifos salvos deste arquivo.
+    highlightsKeyRef.current = `${HL_LOCAL_PREFIX}-${file.name}`;
+    const savedHls = loadHighlights(file.name);
+    savedHls.forEach(h => {
+      try {
+        rendition.annotations.add(
+          'highlight',
+          h.cfi,
+          { color: h.color },
+          undefined,
+          'sepia-hl',
+          { fill: HIGHLIGHT_COLORS[h.color].fill, 'fill-opacity': HIGHLIGHT_COLORS[h.color].opacity } as any,
+        );
+      } catch { /* cfi órfão */ }
+    });
+    highlightsRef.current = savedHls;
+    setHighlights(savedHls);
+
+    // Gera índices de "páginas" no fundo (para o salto de página em EPUB).
+    void (async () => {
+      try {
+        await book.ready;
+        await book.locations.generate(1500);
+        if (bookRef.current === book) setEpubPageTotal(book.locations.length());
+      } catch { /* não determinístico p/ esse livro */ }
+    })();
 
     upsertLibrary({ name: file.name, index: 0, total: 0, epub: true, updated: Date.now() });
     
@@ -654,6 +864,7 @@ export default function Reader() {
     void idbDelete(COVER_STORE, name).catch(() => {});
     try {
       localStorage.removeItem(`reader-progress-${name}`);
+      localStorage.removeItem(`${HL_LOCAL_PREFIX}-${name}`);
       const raw = localStorage.getItem('reader-library');
       const list: LibEntry[] = raw ? JSON.parse(raw) : [];
       const next = list.filter(e => e.name !== name);
@@ -694,6 +905,330 @@ export default function Reader() {
 
   const toggleUi = () => setIsUiVisible(!isUiVisible);
 
+  // Total de páginas exibível para a barra de paginação / salto.
+  const pageJumpTotal = useMemo(() => {
+    if (!fileType) return 0;
+    if (fileType === 'epub') {
+      if (epubPageTotal && epubPageTotal > 0) return epubPageTotal;
+      return (bookRef.current?.spine as unknown as { length?: number } | undefined)?.length || 0;
+    }
+    return pages.length;
+  }, [fileType, epubPageTotal, pages.length]);
+
+  // Navega para a página informada (1-based). Para EPUB usa a lista de
+  // locations gerada (fallback: salta pelo índice de capítulos).
+  const goToPageNum = useCallback((target: number) => {
+    if (!fileType) return;
+    if (fileType === 'epub') {
+      const book = bookRef.current;
+      const rendition = renditionRef.current;
+      if (!book || !rendition) return;
+      if (book.locations && book.locations.length() > 1) {
+        const total = book.locations.length();
+        const page = clamp(Math.round(target), 1, total);
+        const progress = (page - 1) / (total - 1);
+        const cfi = book.locations.cfiFromPercentage(progress);
+        if (cfi) { rendition.display(cfi); return; }
+      }
+      const spineLen = (book.spine as unknown as { length?: number } | undefined)?.length || 0;
+      if (spineLen > 0) {
+        const idx = clamp(Math.round(target) - 1, 0, spineLen - 1);
+        const section = book.spine.get(idx);
+        if (section) rendition.display(section.cfiBase);
+      }
+      return;
+    }
+    const total = pages.length;
+    if (!total) return;
+    const page = clamp(Math.round(target), 1, total);
+    applyZoom(1);
+    setDirection(page > currentIndexRef.current ? 1 : -1);
+    setCurrentIndex(page - 1);
+  }, [fileType, pages.length, applyZoom]);
+
+  const submitPageJump = useCallback((e?: React.FormEvent) => {
+    e?.preventDefault();
+    const total = pageJumpTotal;
+    if (!total || total <= 0) return;
+    const parsed = parseInt(pageInput, 10);
+    if (!isFinite(parsed) || String(parsed) !== String(pageInput).trim()) {
+      showFlash('Digite um número de página válido.');
+      return;
+    }
+    const target = clamp(parsed, 1, total);
+    if (parsed !== target) {
+      showFlash(`Página fora do intervalo (1–${total}); ajustado para ${target}.`);
+    }
+    goToPageNum(target);
+    setPageInput('');
+  }, [pageInput, pageJumpTotal, goToPageNum, showFlash]);
+
+  // ----- Busca de texto (Ctrl+F) -----
+  const snippetFromMatch = useCallback((text: string, start: number, end: number) => {
+    const RADIUS = 46;
+    const ctxStart = Math.max(0, start - RADIUS);
+    const ctxEnd = Math.min(text.length, end + RADIUS);
+    const body = text.slice(ctxStart, ctxEnd);
+    const localStart = start - ctxStart;
+    const localEnd = end - ctxStart;
+    const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const highlighted = `${esc(body.slice(0, localStart))}<mark>${esc(body.slice(localStart, localEnd))}</mark>${esc(body.slice(localEnd))}`;
+    return `${ctxStart > 0 ? '…' : ''}${highlighted}${ctxEnd < text.length ? '…' : ''}`;
+  }, []);
+
+  const jumpToResult = useCallback((result: SearchResult) => {
+    if (result.pdfPageIndex != null) {
+      applyZoom(1);
+      setDirection(result.pdfPageIndex > currentIndexRef.current ? 1 : -1);
+      setCurrentIndex(result.pdfPageIndex);
+    } else if (result.cfi && renditionRef.current) {
+      renditionRef.current.display(result.cfi);
+    }
+    searchNonceRef.current += 1;
+    setSearchOpen(false);
+    setSearchStatus('idle');
+    setIsUiVisible(false);
+  }, [applyZoom]);
+
+  const runSearch = useCallback(async (query: string) => {
+    const q = query.trim();
+    if (!q) { setSearchResults([]); setSearchStatus('idle'); return; }
+    const nonce = ++searchNonceRef.current;
+    setSearchStatus('searching');
+    setSearchResults([]);
+
+    const escaped = escapeRegExp(q);
+    const results: SearchResult[] = [];
+    const push = (r: SearchResult) => {
+      if (results.length >= SEARCH_RESULT_LIMIT) return false;
+      results.push(r);
+      return true;
+    };
+
+    try {
+      if (fileType === 'pdf') {
+        const pdf = pdfDocRef.current;
+        if (!pdf) { setSearchStatus('error'); return; }
+        const cache = pdfTextCacheRef.current;
+        const re = new RegExp(escaped, 'gi');
+        for (let i = 0; i < pdf.numPages && searchNonceRef.current === nonce; i++) {
+          let text = cache[i];
+          if (text === undefined) {
+            const page = await pdf.getPage(i + 1);
+            const tc = await page.getTextContent({ includeMarkedContent: true } as any);
+            text = flattenPdfText(tc.items as Array<{ str?: string }>);
+            cache[i] = text;
+          }
+          if (searchNonceRef.current !== nonce) return;
+          re.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          while ((m = re.exec(text)) !== null && searchNonceRef.current === nonce) {
+            const start = m.index;
+            const end = m.index + m[0].length;
+            if (!push({
+              id: `pdf-${i}-${start}`,
+              label: `Página ${i + 1}`,
+              context: snippetFromMatch(text, start, end),
+              pdfPageIndex: i,
+            })) break;
+            if (m.index === re.lastIndex) re.lastIndex += 1;
+          }
+          if ((i + 1) % 4 === 0) await new Promise(r => setTimeout(r, 0));
+        }
+      } else if (fileType === 'epub') {
+        const book = bookRef.current;
+        if (!book || !book.spine) { setSearchStatus('error'); return; }
+        await book.ready;
+        if (searchNonceRef.current !== nonce) return;
+        const spineLen = (book.spine as unknown as { length?: number }).length || 0;
+        for (let i = 0; i < spineLen && searchNonceRef.current === nonce; i++) {
+          let section: any;
+          try {
+            section = book.spine.get(i);
+            await section.load(book.load.bind(book));
+          } catch {
+            continue;
+          }
+          if (searchNonceRef.current !== nonce) return;
+          const doc = section.document;
+          const root = (doc && (doc.body || doc.documentElement)) as HTMLElement | null;
+          if (doc && root && typeof doc.createTreeWalker === 'function') {
+            const segments: Array<{ node: Text; start: number; end: number; text: string }> = [];
+            const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            let node: Node | null;
+            let offset = 0;
+            while ((node = walker.nextNode())) {
+              const parent = node.parentNode as Element | null;
+              if (parent && /script|style|noscript|template|head/i.test(parent.tagName)) continue;
+              const t = (node.nodeValue || '');
+              if (!t.trim()) continue;
+              segments.push({ node: node as Text, start: offset, end: offset + t.length, text: t });
+              offset += t.length;
+            }
+            const full = segments.map(s => s.text).join('');
+            const re = new RegExp(escaped, 'gi');
+            let m: RegExpExecArray | null;
+            while ((m = re.exec(full)) !== null && searchNonceRef.current === nonce) {
+              const start = m.index;
+              const end = m.index + m[0].length;
+              const segIndex = (sIdx: number) => {
+                let lo = 0, hi = segments.length - 1, ans = 0;
+                while (lo <= hi) {
+                  const mid = (lo + hi) >> 1;
+                  if (segments[mid].start <= sIdx) { ans = mid; lo = mid + 1; }
+                  else hi = mid - 1;
+                }
+                return ans;
+              };
+              const si = segIndex(start);
+              const ei = segIndex(Math.max(start, end - 1));
+              const startSeg = segments[si];
+              const endSeg = segments[ei];
+              let cfi = '';
+              try {
+                const range = doc.createRange();
+                range.setStart(startSeg.node, start - startSeg.start);
+                range.setEnd(endSeg.node, Math.min(endSeg.text.length, end - endSeg.start));
+                cfi = section.cfiFromRange(range);
+              } catch { /* range inválido */ }
+              if (!push({
+                id: `epub-${i}-${start}`,
+                label: `Capítulo ${i + 1}`,
+                context: snippetFromMatch(full, start, end),
+                cfi: cfi || undefined,
+              })) break;
+              if (m.index === re.lastIndex) re.lastIndex += 1;
+            }
+          }
+          try { section.unload(); } catch { /* ignore */ }
+          if ((i + 1) % 3 === 0) await new Promise(r => setTimeout(r, 0));
+        }
+      } else {
+        setSearchStatus('unsupported');
+        return;
+      }
+      if (searchNonceRef.current !== nonce) return;
+      setSearchResults(results);
+      setSearchStatus('done');
+    } catch (err) {
+      if (searchNonceRef.current === nonce) {
+        setSearchStatus('error');
+        setSearchResults([]);
+      }
+    }
+  }, [fileType, escapeRegExp, flattenPdfText, snippetFromMatch]);
+
+  // Debounce da busca enquanto o painel está aberto.
+  useEffect(() => {
+    if (!searchOpen) return;
+    const q = searchQuery.trim();
+    if (!q) { setSearchResults([]); setSearchStatus('idle'); return; }
+    const t = setTimeout(() => { runSearch(q); }, 350);
+    return () => clearTimeout(t);
+  }, [searchQuery, searchOpen, runSearch]);
+
+  // Foca o campo de busca ao abrir via Ctrl/Cmd+F ou ícone.
+  useEffect(() => {
+    if (searchOpen) {
+      const t = setTimeout(() => searchInputRef.current?.focus(), 60);
+      return () => clearTimeout(t);
+    }
+  }, [searchOpen]);
+
+  // Busca em arquivos de imagem não faz sentido: mostra o aviso direto.
+  useEffect(() => {
+    if (searchOpen && fileType === 'image') setSearchStatus('unsupported');
+  }, [searchOpen, fileType]);
+
+  // ----- Grifar / destacar texto (EPUB) -----
+  const clearContentsSelection = useCallback(() => {
+    try {
+      const rendition = renditionRef.current;
+      const contents = rendition?.getContents();
+      contents?.window?.getSelection()?.removeAllRanges();
+    } catch { /* ignore */ }
+  }, []);
+
+  const addHighlight = useCallback((color: HighlightKey) => {
+    const popover = hlPopoverRef.current;
+    const rendition = renditionRef.current;
+    if (!popover || !rendition || !fileName) return;
+    try {
+      rendition.annotations.add(
+        'highlight',
+        popover.cfi,
+        { color },
+        undefined,
+        'sepia-hl',
+        { fill: HIGHLIGHT_COLORS[color].fill, 'fill-opacity': HIGHLIGHT_COLORS[color].opacity } as any,
+      );
+    } catch { /* cfi inválido */ }
+
+    const existing = highlightsRef.current;
+    const idx = existing.findIndex(h => h.cfi === popover.cfi);
+    const next = idx >= 0
+      ? existing.map((h, i) => (i === idx ? { ...h, color } : h))
+      : [...existing, { cfi: popover.cfi, color }];
+    highlightsRef.current = next;
+    setHighlights(next);
+    saveHighlights(fileName, next);
+
+    clearContentsSelection();
+    setHlPopover(null);
+    hlPopoverRef.current = null;
+  }, [fileName, clearContentsSelection, saveHighlights]);
+
+  const rangesOverlap = useCallback((a: Range, b: Range): boolean => {
+    try {
+      const aBeforeB = a.compareBoundaryPoints(Range.END_TO_START, b) === 1;
+      const bBeforeA = b.compareBoundaryPoints(Range.END_TO_START, a) === 1;
+      return aBeforeB && bBeforeA;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const removeHighlightAtSelection = useCallback(() => {
+    const popover = hlPopoverRef.current;
+    const rendition = renditionRef.current;
+    if (!popover || !rendition || !fileName) return;
+
+    const contents = rendition.getContents();
+    let removedNames: string[] = [];
+    if (contents) {
+      try {
+        const selRange = contents.range(popover.cfi);
+        const toRemove = highlightsRef.current.filter(h => {
+          try {
+            const hlRange = contents.range(h.cfi);
+            return rangesOverlap(selRange, hlRange);
+          } catch {
+            return false;
+          }
+        });
+        toRemove.forEach(h => {
+          try {
+            rendition.annotations.remove(h.cfi, 'highlight');
+            removedNames.push(h.cfi);
+          } catch { /* já removido */ }
+        });
+      } catch { /* seleção inválida */ }
+    }
+
+    const next = highlightsRef.current.filter(h => !removedNames.includes(h.cfi));
+    if (removedNames.length > 0) {
+      highlightsRef.current = next;
+      setHighlights(next);
+      saveHighlights(fileName, next);
+      showFlash(`${removedNames.length} grifo(s) removido(s).`);
+    } else {
+      showFlash('Nenhum grifo encontrado nesta seleção.');
+    }
+    clearContentsSelection();
+    setHlPopover(null);
+    hlPopoverRef.current = null;
+  }, [fileName, clearContentsSelection, rangesOverlap, saveHighlights, showFlash]);
+
   useEffect(() => {
     if (fileName && pages.length > 0 && fileType !== 'epub') {
       localStorage.setItem(`reader-progress-${fileName}`, currentIndex.toString());
@@ -703,9 +1238,30 @@ export default function Reader() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        if (fileType) {
+          setSearchOpen(true);
+          setTimeout(() => searchInputRef.current?.focus(), 0);
+        }
+        return;
+      }
+      if (e.key === 'Escape' && searchOpenRef.current) {
+        e.preventDefault();
+        setSearchOpen(false);
+        setSearchStatus('idle');
+        return;
+      }
+      if (e.key === 'Escape' && hlPopoverRef.current) {
+        e.preventDefault();
+        clearContentsSelection();
+        setHlPopover(null);
+        hlPopoverRef.current = null;
+        return;
+      }
       if (e.key === 'ArrowRight') goToNext();
       if (e.key === 'ArrowLeft') goToPrev();
-      if (e.key.toLowerCase() === 'f') {
+      if (e.key.toLowerCase() === 'f' && !e.ctrlKey && !e.metaKey) {
         e.preventDefault();
         if (!document.fullscreenElement) document.documentElement.requestFullscreen();
         else document.exitFullscreen();
@@ -714,7 +1270,7 @@ export default function Reader() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [goToNext, goToPrev]);
+  }, [goToNext, goToPrev, fileType, clearContentsSelection]);
 
   useEffect(() => {
     return () => closeFile();
@@ -970,11 +1526,11 @@ export default function Reader() {
             initial={{ y: -100 }} 
             animate={{ y: 0 }} 
             exit={{ y: -100 }}
-            className={`fixed top-0 w-full px-2 sm:px-3 py-2 md:py-3 flex items-center justify-between z-50 border-b backdrop-blur-md shadow-lg ${BAR_STYLES[theme].wrap}`}
+            className={`fixed top-0 w-full px-2 sm:px-3 py-2 md:py-3 grid grid-cols-[auto_1fr_auto] items-center gap-2 md:gap-3 z-50 border-b backdrop-blur-md shadow-lg ${BAR_STYLES[theme].wrap}`}
             onClick={(e) => e.stopPropagation()}
           >
             {/* Esquerda: Fechar + Nome do arquivo */}
-            <div className="flex items-center gap-1 sm:gap-2 min-w-0 max-w-[55%] flex-1 justify-self-start overflow-hidden">
+            <div className="flex items-center gap-1 sm:gap-2 min-w-0 max-w-[55vw] justify-self-start overflow-hidden">
               <button 
                 onClick={(e) => {
                   e.stopPropagation();
@@ -988,6 +1544,69 @@ export default function Reader() {
               <span className={`font-medium text-xs sm:text-sm truncate min-w-0 flex-1 text-left ${BAR_STYLES[theme].text}`} title={fileName}>
                 {fileName}
               </span>
+            </div>
+
+            {/* Centro: ferramentas de leitura */}
+            <div className="flex items-center justify-center gap-1 sm:gap-2 min-w-0 px-1">
+              {/* Saltar para página */}
+              <form
+                onSubmit={submitPageJump}
+                title={`Ir para página (1–${pageJumpTotal || 1})`}
+                className={`flex items-center gap-0.5 sm:gap-1 h-8 sm:h-9 px-1.5 sm:px-2 rounded-full ring-1 ring-black/5 shadow-sm ${BAR_STYLES[theme].wrap}`}
+              >
+                <input
+                  value={pageInput}
+                  onChange={(e) => setPageInput(e.target.value)}
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  placeholder="pg"
+                  aria-label="Número da página desejada"
+                  className={`w-7 sm:w-11 bg-transparent outline-none text-center text-xs sm:text-sm font-semibold placeholder:font-normal placeholder:opacity-50 ${BAR_STYLES[theme].text}`}
+                />
+                <span className={`text-[10px] sm:text-xs opacity-60 whitespace-nowrap ${BAR_STYLES[theme].text}`}>/ {pageJumpTotal || '—'}</span>
+                <button
+                  type="submit"
+                  className={`hidden min-[420px]:inline text-[9px] sm:text-[10px] font-bold uppercase tracking-wide px-1 sm:px-1.5 py-1 rounded-full ${BAR_STYLES[theme].btn} active:scale-90 transition-transform`}
+                  title="Ir para a página informada"
+                >
+                  Ir
+                </button>
+              </form>
+
+              {/* Busca (Ctrl+F) */}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSearchOpen(v => !v);
+                }}
+                className={`w-7 h-7 sm:w-9 sm:h-9 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${searchOpen ? 'bg-[#e8a766]/30' : BAR_STYLES[theme].btn} hover:shadow-md active:scale-95 transition-all flex-shrink-0`}
+                title="Buscar no texto (Ctrl+F)"
+              >
+                <Search className="w-4 h-4" />
+              </button>
+
+              {/* Tamanho de fonte (EPUB) */}
+              {fileType === 'epub' && (
+                <div className="flex items-center gap-0.5 sm:gap-1 px-0.5 sm:px-1 flex-shrink-0" title="Tamanho do texto">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setFontSize(prev => clamp(prev - 1, FONT_MIN, FONT_MAX)); }}
+                    disabled={fontSize <= FONT_MIN}
+                    className={`w-5 h-5 sm:w-7 sm:h-7 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-90 transition-all disabled:opacity-30 disabled:pointer-events-none text-[10px] sm:text-[11px] font-bold`}
+                    title="Diminuir fonte (A−)"
+                  >
+                    A−
+                  </button>
+                  <span className={`hidden sm:block text-[10px] font-mono opacity-70 w-7 text-center ${BAR_STYLES[theme].text}`}>{fontSize}px</span>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setFontSize(prev => clamp(prev + 1, FONT_MIN, FONT_MAX)); }}
+                    disabled={fontSize >= FONT_MAX}
+                    className={`w-5 h-5 sm:w-7 sm:h-7 flex items-center justify-center rounded-full shadow-sm ring-1 ring-black/5 ${BAR_STYLES[theme].btn} hover:shadow-md active:scale-90 transition-all disabled:opacity-30 disabled:pointer-events-none text-[11px] sm:text-[13px] font-bold`}
+                    title="Aumentar fonte (A+)"
+                  >
+                    A+
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Direita: Utilitários */}
@@ -1043,7 +1662,7 @@ export default function Reader() {
                   e.stopPropagation();
                   copyPix();
                 }}
-                className="flex items-center gap-1.5 px-3 h-9 rounded-full shadow-sm bg-zinc-800 text-white hover:bg-zinc-700 active:scale-95 transition-all flex-shrink-0"
+                className="hidden sm:flex items-center gap-1.5 px-3 h-9 rounded-full shadow-sm bg-zinc-800 text-white hover:bg-zinc-700 active:scale-95 transition-all flex-shrink-0"
                 title="Apoiar com Pix"
               >
                 {pixCopied ? <Check className="w-4 h-4 text-green-400" /> : <Coffee className="w-4 h-4" />}
@@ -1076,6 +1695,141 @@ export default function Reader() {
                 )}
               </div>
             </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Painel de busca (Ctrl+F) */}
+      {searchOpen && (
+        <motion.div
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="fixed top-14 md:top-16 left-1/2 -translate-x-1/2 w-[min(92vw,540px)] z-[55] px-2"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className={`rounded-2xl shadow-2xl border backdrop-blur-md overflow-hidden ${BAR_STYLES[theme].wrap}`}>
+            <form
+              onSubmit={(e) => { e.preventDefault(); runSearch(searchQuery.trim()); }}
+              className="flex items-center gap-2 px-3 py-2.5 border-b border-black/10"
+            >
+              <Search className={`w-4 h-4 flex-shrink-0 ${BAR_STYLES[theme].text} opacity-50`} />
+              <input
+                ref={searchInputRef}
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={fileType === 'image' ? 'Busca indisponível para imagens' : 'Buscar palavra ou frase…'}
+                disabled={fileType === 'image'}
+                className={`flex-1 min-w-0 bg-transparent outline-none text-sm ${BAR_STYLES[theme].text} placeholder:opacity-50 disabled:opacity-40`}
+              />
+              <button
+                type="submit"
+                className={`text-[10px] font-bold uppercase tracking-wide px-2 py-1 rounded-full ${BAR_STYLES[theme].btn} active:scale-90 transition-transform flex-shrink-0`}
+                title="Filtrar resultados"
+              >
+                Buscar
+              </button>
+              <kbd className={`hidden sm:inline-block text-[9px] border rounded px-1 py-0.5 opacity-50 ${BAR_STYLES[theme].text}`}>Ctrl+F</kbd>
+              <button
+                onClick={(e) => { e.stopPropagation(); searchNonceRef.current += 1; setSearchOpen(false); setSearchStatus('idle'); }}
+                className={`w-7 h-7 flex items-center justify-center rounded-full ${BAR_STYLES[theme].btn} active:scale-90 transition-all flex-shrink-0`}
+                title="Fechar busca"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </form>
+            <div className="max-h-[42vh] overflow-y-auto p-2 overscroll-contain">
+              {searchStatus === 'unsupported' && (
+                <p className="px-2 py-3 text-xs opacity-70">Este formato ({fileType === 'image' ? 'CBZ/ZIP' : fileType}) não possui texto pesquisável.</p>
+              )}
+              {searchStatus === 'searching' && (
+                <div className="flex items-center gap-2 px-2 py-3 text-xs opacity-70">
+                  <Loader2 className="w-4 h-4 animate-spin" /> buscando em todo o arquivo…
+                </div>
+              )}
+              {searchStatus === 'error' && (
+                <p className="px-2 py-3 text-xs opacity-70">Não foi possível buscar neste arquivo.</p>
+              )}
+              {searchStatus === 'idle' && !searchQuery.trim() && (
+                <p className="px-2 py-3 text-xs opacity-50">Digite uma palavra ou frase e pressione Enter. Os resultados mostram o contexto e a página/capítulo.</p>
+              )}
+              {searchStatus === 'done' && searchResults.length === 0 && (
+                <p className="px-2 py-3 text-xs opacity-70">Nenhum resultado para “{searchQuery.trim()}”.</p>
+              )}
+              {searchStatus === 'done' && searchResults.length > 0 && (
+                <>
+                  <p className={`text-[10px] uppercase tracking-widest opacity-50 px-2 pb-1 ${BAR_STYLES[theme].text}`}>
+                    {searchResults.length} resultado{searchResults.length === 1 ? '' : 's'}
+                    {searchResults.length >= SEARCH_RESULT_LIMIT ? ` (limite de ${SEARCH_RESULT_LIMIT})` : ''}
+                  </p>
+                  <ul className="flex flex-col gap-1">
+                    {searchResults.map(r => (
+                      <li key={r.id}>
+                        <button
+                          onClick={() => jumpToResult(r)}
+                          className={`w-full text-left px-2 py-1.5 rounded-lg ${BAR_STYLES[theme].btn} active:scale-[0.99] transition-all`}
+                        >
+                          <span className={`text-[10px] font-bold uppercase tracking-wide ${BAR_STYLES[theme].text} opacity-60`}>{r.label}</span>
+                          <p className="text-xs leading-relaxed mt-0.5 [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2] overflow-hidden" dangerouslySetInnerHTML={{ __html: r.context }} />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {/* Popover contextual de grifos (EPUB) */}
+      <AnimatePresence>
+        {hlPopover && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.9, y: 6 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.9, y: 6 }}
+            className="fixed z-[60]"
+            style={{ left: hlPopover.x, top: hlPopover.y }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className={`-translate-x-1/2 px-2 py-1.5 rounded-xl shadow-2xl border backdrop-blur-md ${BAR_STYLES[theme].wrap}`}>
+              <div className="flex items-center gap-1.5">
+                <Highlighter className={`w-3.5 h-3.5 ${BAR_STYLES[theme].text} opacity-60`} />
+                {(Object.keys(HIGHLIGHT_COLORS) as HighlightKey[]).map(k => (
+                  <button
+                    key={k}
+                    onClick={() => addHighlight(k)}
+                    title={HIGHLIGHT_COLORS[k].label}
+                    className="w-6 h-6 rounded-full ring-2 ring-black/20 hover:scale-110 active:scale-95 transition-transform"
+                    style={{ backgroundColor: HIGHLIGHT_COLORS[k].swatch }}
+                  />
+                ))}
+                <span className="w-px h-5 bg-black/15 mx-0.5" />
+                <button
+                  onClick={() => removeHighlightAtSelection()}
+                  title="Remover grifo(s) da seleção"
+                  className={`flex items-center gap-1 px-1.5 h-6 rounded-lg ${BAR_STYLES[theme].btn} active:scale-90 transition-all`}
+                >
+                  <Eraser className="w-3.5 h-3.5" />
+                  <span className={`text-[10px] font-semibold whitespace-nowrap ${BAR_STYLES[theme].text}`}>Remover Grifo</span>
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Feedback discreto (toast) */}
+      <AnimatePresence>
+        {flashMsg && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="fixed top-16 left-1/2 -translate-x-1/2 z-[70] px-3.5 py-1.5 rounded-full shadow-lg bg-black/85 text-white text-xs"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {flashMsg}
           </motion.div>
         )}
       </AnimatePresence>
