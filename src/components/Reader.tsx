@@ -1834,7 +1834,7 @@ export default function Reader() {
               >
                 <X className="w-5 h-5" />
               </button>
-              <span className={`font-medium text-xs sm:text-sm truncate min-w-0 flex-1 text-left ${BAR_STYLES[theme].text}`} title={fileName}>
+              <span className={`font-medium text-xs sm:text-sm truncate min-w-0 flex-1 max-w-[30vw] sm:max-w-[180px] text-left ${BAR_STYLES[theme].text}`} title={fileName}>
                 {fileName}
               </span>
             </div>
