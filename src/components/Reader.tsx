@@ -1826,11 +1826,11 @@ export default function Reader() {
             initial={{ y: -100 }} 
             animate={{ y: 0 }} 
             exit={{ y: -100 }}
-            className={`fixed top-0 w-full px-2 sm:px-3 py-2 md:py-3 grid grid-cols-[minmax(0,auto)_1fr_minmax(0,auto)] items-center gap-2 md:gap-3 z-50 border-b backdrop-blur-md shadow-lg ${BAR_STYLES[theme].wrap}`}
+            className={`fixed top-0 w-full px-2 sm:px-3 py-2 md:py-3 flex items-center gap-2 md:gap-3 z-50 border-b backdrop-blur-md shadow-lg ${BAR_STYLES[theme].wrap}`}
             onClick={(e) => e.stopPropagation()}
           >
             {/* Esquerda: Fechar + Nome do arquivo */}
-            <div className="flex items-center gap-1 sm:gap-2 min-w-0 max-w-[40vw] justify-self-start overflow-hidden">
+            <div className="flex items-center gap-1 sm:gap-2 min-w-0 max-w-[30vw] sm:max-w-[200px] shrink-0 overflow-hidden justify-self-start">
               <button 
                 onClick={(e) => {
                   e.stopPropagation();
@@ -1841,13 +1841,13 @@ export default function Reader() {
               >
                 <X className="w-5 h-5" />
               </button>
-              <span className={`font-medium text-xs sm:text-sm truncate min-w-0 flex-1 max-w-[30vw] sm:max-w-[220px] text-left ${BAR_STYLES[theme].text}`} title={fileName}>
+              <span className={`font-medium text-xs sm:text-sm truncate min-w-0 flex-1 text-left ${BAR_STYLES[theme].text}`} title={fileName}>
                 {displayFileName}
               </span>
             </div>
 
             {/* Centro: ferramentas de leitura */}
-            <div className="flex items-center justify-center gap-1 sm:gap-2 min-w-0 max-w-full overflow-hidden px-1 justify-self-center">
+            <div className="flex-1 min-w-0 flex items-center justify-center gap-1 sm:gap-2 overflow-hidden px-1">
               {/* Saltar para página */}
               <form
                 onSubmit={submitPageJump}
@@ -1944,7 +1944,7 @@ export default function Reader() {
             </div>
 
             {/* Direita: Utilitários */}
-            <div className="flex items-center gap-1 sm:gap-2 min-w-0 justify-self-end">
+            <div className="flex items-center gap-1 sm:gap-2 min-w-0 shrink-0 justify-self-end">
               {fileType !== 'epub' && (
                 <div className="flex items-center gap-0.5 sm:gap-1" title="Zoom (Ctrl+rodinha ou trackpad)">
                   <button 
