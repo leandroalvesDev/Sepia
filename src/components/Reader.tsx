@@ -322,6 +322,9 @@ export default function Reader() {
 
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
   const didDragRef = useRef(false);
+  // Origem do pan no início de um arrasto em zoom (usada p/ recompor o alvo
+  // a partir do offset do framer e re-limitar de forma determinística).
+  const dragPanStartRef = useRef({ x: 0, y: 0 });
   const zoomRef = useRef(1);
   const renderTaskRef = useRef<any>(null);
   const loadingPagesRef = useRef<Set<number>>(new Set());
@@ -1503,6 +1506,13 @@ export default function Reader() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isTyping = !!target && (
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.tagName === 'SELECT' ||
+        target.isContentEditable
+      );
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
         e.preventDefault();
         if (fileType) {
@@ -1511,8 +1521,38 @@ export default function Reader() {
         }
         return;
       }
-      // Ctrl/Cmd+G → ir para página (também 'g' simples).
-      if (((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'g') || (e.key.toLowerCase() === 'g' && !e.ctrlKey && !e.metaKey && !searchOpenRef.current)) {
+      // Ctrl/Cmd+G → ir para página (funciona também dentro de campos).
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'g') {
+        if (!fileType) return;
+        e.preventDefault();
+        setIsUiVisible(true);
+        const el = document.getElementById('page-jump-input') as HTMLInputElement | null;
+        setTimeout(() => { el?.focus(); el?.select(); }, 60);
+        return;
+      }
+      // Enquanto digita em campo de texto, não intercepta atalhos da leitora
+      // ('1' reiniciar zoom, setas virar página, +/- zoom, 'g', etc.).
+      // Sem isso, o usuário não consegue digitar "1" no campo pg/100.
+      if (isTyping) {
+        if (e.key === 'Escape') {
+          if (searchOpenRef.current) {
+            e.preventDefault();
+            setSearchOpen(false);
+            setSearchStatus('idle');
+            return;
+          }
+          if (hlPopoverRef.current) {
+            e.preventDefault();
+            clearContentsSelection();
+            setHlPopover(null);
+            hlPopoverRef.current = null;
+            return;
+          }
+        }
+        return;
+      }
+      // 'g' simples → ir para página (fora de campos de texto).
+      if (e.key.toLowerCase() === 'g' && !searchOpenRef.current) {
         if (!fileType) return;
         e.preventDefault();
         setIsUiVisible(true);
@@ -2312,7 +2352,23 @@ export default function Reader() {
             dragConstraints={zoom > 1 ? getPanConstraints() : { left: 0, right: 0 }}
             dragElastic={0}
             dragDirectionLock
-            onDragStart={() => { didDragRef.current = true; }}
+            dragMomentum={zoom > 1 ? false : true}
+            onDragStart={() => {
+              didDragRef.current = true;
+              dragPanStartRef.current = { x: panX.get(), y: panY.get() };
+            }}
+            onDrag={(e, { offset }) => {
+              if (zoom <= 1) return;
+              // Recomposição determinística do pan a partir da origem + offset,
+              // re-limitada às bordas. O constraint do framer falha com deltas
+              // grandes (arrojo/gesto rápido) e deixa a página "escapar" do
+              // limite em zooms fracionários (ex.: 127%). Aqui o resultado final
+              // de cada frame é sempre a versão limitada.
+              const s = dragPanStartRef.current;
+              const p = clampPan(s.x + offset.x, s.y + offset.y);
+              panX.set(p.x);
+              panY.set(p.y);
+            }}
             onDragEnd={(e, { offset, velocity }) => {
               if (zoom > 1) {
                 // Reforça os limites no fim do arrasto (seguro p/ momentum).
