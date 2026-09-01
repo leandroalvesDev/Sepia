@@ -158,6 +158,13 @@ export default function Reader() {
       const p = clampPan(anchor.x, anchor.y);
       panX.set(p.x);
       panY.set(p.y);
+    } else {
+      // Zoom sem âncora (botões, teclado, duplo toque, pinça): mantém o pan
+      // atual, mas recalcula os limites do novo zoom. Sem isso, uma página já
+      // arrastada até a borda fica "para fora" da tela ao reduzir o zoom.
+      const p = clampPan(panX.get(), panY.get());
+      panX.set(p.x);
+      panY.set(p.y);
     }
   }, [panX, panY, clampPan]);
 
@@ -2308,6 +2315,10 @@ export default function Reader() {
             onDragStart={() => { didDragRef.current = true; }}
             onDragEnd={(e, { offset, velocity }) => {
               if (zoom > 1) {
+                // Reforça os limites no fim do arrasto (seguro p/ momentum).
+                const p = clampPan(panX.get(), panY.get());
+                panX.set(p.x);
+                panY.set(p.y);
                 setTimeout(() => { didDragRef.current = false; }, 50);
                 return;
               }
@@ -2321,6 +2332,12 @@ export default function Reader() {
               }
 
               setTimeout(() => { didDragRef.current = false; }, 50);
+            }}
+            onDragTransitionEnd={() => {
+              // Após o momentum, garante que o pan não passe das bordas.
+              const p = clampPan(panX.get(), panY.get());
+              panX.set(p.x);
+              panY.set(p.y);
             }}
             onTap={(e, info) => {
               if (didDragRef.current) {
